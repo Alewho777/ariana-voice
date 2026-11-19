@@ -27,6 +27,7 @@ class OutboundHumanBridgeCallSession extends HumanBridgeCallSession {
 
         this.status = "offer_ready";
         this.markActivity("meta_offer_ready");
+        this.startLifecycleWatch();
         this.log("human bridge outbound offer_sdp ready", {
             offer_sdp_bytes: this.metaPc.localDescription.sdp.length,
         });

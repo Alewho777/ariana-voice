@@ -1,4 +1,5 @@
 const env = require("../config/env");
+const callSessionManager = require("../modules/calls/call-session.manager");
 const renderHealthPage = require("../views/health-page");
 
 function index(req, res) {
@@ -12,12 +13,16 @@ function index(req, res) {
 }
 
 function health(req, res) {
+    const memory = process.memoryUsage();
     const payload = {
         ok: true,
         status: "healthy",
         timestamp: new Date().toISOString(),
         service: env.appName,
         environment: env.nodeEnv,
+        active_sessions: callSessionManager.listSessions().length,
+        memory_rss_mb: Math.round(memory.rss / (1024 * 1024)),
+        uptime_seconds: Math.round(process.uptime()),
     };
 
     respond(req, res, payload);

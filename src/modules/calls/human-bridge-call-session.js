@@ -9,6 +9,19 @@ const { normalizeTtsConfig } = require("./voice-profile");
 const { RTCAudioSink, RTCAudioSource } = wrtc.nonstandard;
 const RTC_AUDIO_FRAME_SAMPLES = 480;
 const TONE_SAMPLE_RATE = 48000;
+const WAIT_TONE_LOW_WATER_MS = 1200;
+const WAIT_TONE_POLL_MS = 1000;
+const LIFECYCLE_CHECK_INTERVAL_MS = 10000;
+
+let cachedWaitMusicPcm = null;
+
+function getCachedWaitMusicPcm() {
+    if (!cachedWaitMusicPcm) {
+        cachedWaitMusicPcm = generateWaitMusicPcm();
+    }
+
+    return cachedWaitMusicPcm;
+}
 
 class HumanBridgeCallSession {
     constructor(payload, options = {}) {
@@ -60,6 +73,9 @@ class HumanBridgeCallSession {
         this.waitPlaybackStarted = false;
         this.waitPlaybackPreparing = false;
         this.waitToneTimer = null;
+        this.lifecycleTimer = null;
+        this.lastMetaFrameAt = null;
+        this.metaDisconnectedSince = null;
         this.lastActivityAt = Date.now();
         this.lastActivityType = "created";
     }
@@ -89,6 +105,7 @@ class HumanBridgeCallSession {
 
         this.status = "answer_ready";
         this.markActivity("meta_answer_ready");
+        this.startLifecycleWatch();
         this.log("human bridge meta answer_sdp ready", {
             answer_sdp_bytes: this.metaPc.localDescription.sdp.length,
         });
@@ -145,6 +162,8 @@ class HumanBridgeCallSession {
             }
 
             this.metaFramesReceived += 1;
+            this.lastMetaFrameAt = Date.now();
+            this.metaDisconnectedSince = null;
             this.markActivity("meta_audio");
             this.recording.recordCustomerData(data);
 
@@ -318,7 +337,15 @@ class HumanBridgeCallSession {
                 return;
             }
 
-            this.metaAudioOutput.enqueuePcm(generateWaitMusicPcm(), {
+            const bufferedMs =
+                typeof this.metaAudioOutput.bufferedMs === "function"
+                    ? this.metaAudioOutput.bufferedMs()
+                    : 0;
+            if (bufferedMs > WAIT_TONE_LOW_WATER_MS) {
+                return;
+            }
+
+            this.metaAudioOutput.enqueuePcm(getCachedWaitMusicPcm(), {
                 source: "human_bridge_wait_music",
             }).catch((error) => {
                 this.log("human bridge waiting music failed", {
@@ -330,7 +357,14 @@ class HumanBridgeCallSession {
         };
 
         enqueueTone();
-        this.waitToneTimer = setInterval(enqueueTone, env.humanBridgeWaitToneIntervalMs);
+        const pollMs = Math.max(
+            500,
+            Math.min(WAIT_TONE_POLL_MS, Number(env.humanBridgeWaitToneIntervalMs || WAIT_TONE_POLL_MS))
+        );
+        this.waitToneTimer = setInterval(enqueueTone, pollMs);
+        if (this.waitToneTimer.unref) {
+            this.waitToneTimer.unref();
+        }
     }
 
     stopWaitingPlayback(reason = "waiting_stopped") {
@@ -652,6 +686,8 @@ class HumanBridgeCallSession {
 
         this.closedAt = new Date();
         this.status = "closed";
+        this.stopLifecycleWatch();
+        this.metaDisconnectedSince = null;
         this.stopWaitingPlayback(reason);
 
         await this.closeAgentPeer(reason);
@@ -705,12 +741,17 @@ class HumanBridgeCallSession {
         this.log("human bridge peer state", { peer, state });
 
         if (peer === "meta" && ["connected", "completed"].includes(state)) {
+            this.metaDisconnectedSince = null;
             this.startWaitingPlayback(`meta_peer_${state}`).catch((error) => {
                 this.log("human bridge waiting playback failed", {
                     reason: `meta_peer_${state}`,
                     error: error.message,
                 });
             });
+        }
+
+        if (peer === "meta" && state === "disconnected" && !this.metaDisconnectedSince) {
+            this.metaDisconnectedSince = Date.now();
         }
 
         if (["failed", "closed"].includes(state) && peer === "meta" && !this.closedAt) {
@@ -724,6 +765,7 @@ class HumanBridgeCallSession {
         this.log("human bridge ice state", { peer, state });
 
         if (peer === "meta" && ["connected", "completed"].includes(state)) {
+            this.metaDisconnectedSince = null;
             this.startWaitingPlayback(`meta_ice_${state}`).catch((error) => {
                 this.log("human bridge waiting playback failed", {
                     reason: `meta_ice_${state}`,
@@ -732,11 +774,120 @@ class HumanBridgeCallSession {
             });
         }
 
+        if (peer === "meta" && state === "disconnected" && !this.metaDisconnectedSince) {
+            this.metaDisconnectedSince = Date.now();
+        }
+
         if (["failed", "closed"].includes(state) && peer === "meta" && !this.closedAt) {
             this.close(`${peer}_ice_${state}`).catch((error) => {
                 console.error("Error closing human bridge after ice state", error);
             });
         }
+    }
+
+    startLifecycleWatch() {
+        if (this.lifecycleTimer || this.closedAt) {
+            return;
+        }
+
+        this.lifecycleTimer = setInterval(() => {
+            this.checkLifecycle();
+        }, LIFECYCLE_CHECK_INTERVAL_MS);
+
+        if (this.lifecycleTimer.unref) {
+            this.lifecycleTimer.unref();
+        }
+    }
+
+    stopLifecycleWatch() {
+        if (!this.lifecycleTimer) {
+            return;
+        }
+
+        clearInterval(this.lifecycleTimer);
+        this.lifecycleTimer = null;
+    }
+
+    checkLifecycle(now = Date.now()) {
+        if (this.closedAt) {
+            this.stopLifecycleWatch();
+            return null;
+        }
+
+        const ageMs = now - this.createdAt.getTime();
+        const maxDurationMs = Math.max(
+            Number(env.humanBridgeMaxDurationMs || 0),
+            Number(env.callMaxDurationMs || 0)
+        );
+
+        if (maxDurationMs > 0 && ageMs >= maxDurationMs) {
+            this.log("human bridge max duration reached", {
+                age_ms: ageMs,
+                max_duration_ms: maxDurationMs,
+                meta_frames_received: this.metaFramesReceived,
+            });
+            this.close("human_bridge_max_duration").catch((error) => {
+                console.error("Error closing human bridge on max duration", error);
+            });
+            return "human_bridge_max_duration";
+        }
+
+        const disconnectedTimeoutMs = Number(env.humanBridgeDisconnectedTimeoutMs || 0);
+        if (
+            disconnectedTimeoutMs > 0 &&
+            this.metaDisconnectedSince &&
+            now - this.metaDisconnectedSince >= disconnectedTimeoutMs
+        ) {
+            this.log("human bridge disconnected timeout reached", {
+                disconnected_ms: now - this.metaDisconnectedSince,
+                disconnected_timeout_ms: disconnectedTimeoutMs,
+                meta_frames_received: this.metaFramesReceived,
+            });
+            this.close("meta_ice_disconnected_timeout").catch((error) => {
+                console.error("Error closing human bridge on disconnected timeout", error);
+            });
+            return "meta_ice_disconnected_timeout";
+        }
+
+        const connectTimeoutMs = Number(env.humanBridgeConnectTimeoutMs || 0);
+        if (
+            connectTimeoutMs > 0 &&
+            this.metaFramesReceived === 0 &&
+            !this.agentWs &&
+            !this.agentPc &&
+            !this.isMetaPlaybackReady() &&
+            ageMs >= connectTimeoutMs
+        ) {
+            this.log("human bridge connect timeout reached", {
+                age_ms: ageMs,
+                connect_timeout_ms: connectTimeoutMs,
+                status: this.status,
+            });
+            this.close("meta_connect_timeout").catch((error) => {
+                console.error("Error closing human bridge on connect timeout", error);
+            });
+            return "meta_connect_timeout";
+        }
+
+        const mediaIdleTimeoutMs = Number(env.humanBridgeMediaIdleTimeoutMs || 0);
+        if (
+            mediaIdleTimeoutMs > 0 &&
+            this.metaFramesReceived > 0 &&
+            this.lastMetaFrameAt &&
+            now - this.lastMetaFrameAt >= mediaIdleTimeoutMs
+        ) {
+            this.log("human bridge meta media idle timeout reached", {
+                idle_ms: now - this.lastMetaFrameAt,
+                media_idle_timeout_ms: mediaIdleTimeoutMs,
+                meta_frames_received: this.metaFramesReceived,
+            });
+            this.close("meta_media_idle_timeout").catch((error) => {
+                console.error("Error closing human bridge on media idle timeout", error);
+            });
+            return "meta_media_idle_timeout";
+        }
+
+        return null;
     }
 
     waitForMetaPlaybackReady() {

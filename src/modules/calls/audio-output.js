@@ -3,6 +3,11 @@ const fsp = require("fs/promises");
 const os = require("os");
 const path = require("path");
 
+const env = require("../../config/env");
+
+const audioUrlPcmCache = new Map();
+const inFlightAudioUrlLoads = new Map();
+
 class AudioOutput {
     constructor(source, options = {}) {
         this.source = source;
@@ -203,30 +208,55 @@ class AudioOutput {
     }
 
     async enqueueAudioUrl(audioUrl, metadata = {}) {
-        const downloaded = await downloadAudioToTemp(audioUrl);
+        const normalizedUrl = String(audioUrl || "").trim();
+        const cacheKey = `${normalizedUrl}|${this.sampleRate}|${this.channelCount}`;
+        const cached = getCachedAudioUrlPcm(cacheKey);
 
-        this.log("agent audio_url downloaded", {
-            audio_url: audioUrl,
-            bytes_downloaded: downloaded.bytes,
-            content_type: downloaded.contentType,
-            file_path: downloaded.filePath,
-            metadata,
-        });
+        if (cached) {
+            this.log("agent audio_url cache hit", {
+                audio_url: normalizedUrl,
+                pcm_bytes: cached.pcm.length,
+                frames: Math.ceil(cached.pcm.length / this.frameBytes),
+                metadata,
+            });
 
-        try {
-            const playback = await this.enqueueFile(downloaded.filePath, {
+            const playback = await this.enqueuePcm(cached.pcm, {
                 ...metadata,
-                audio_url: audioUrl,
+                audio_url: normalizedUrl,
+                cache_hit: true,
             });
 
             return {
                 ...playback,
-                bytesDownloaded: downloaded.bytes,
-                contentType: downloaded.contentType,
+                bytesDownloaded: cached.bytesDownloaded,
+                contentType: cached.contentType,
+                cacheHit: true,
             };
-        } finally {
-            await fsp.unlink(downloaded.filePath).catch(() => {});
         }
+
+        const loaded = await loadAndConvertAudioUrlOnce(
+            cacheKey,
+            normalizedUrl,
+            {
+                sampleRate: this.sampleRate,
+                channelCount: this.channelCount,
+                frameBytes: this.frameBytes,
+                metadata,
+                logger: (message, data) => this.log(message, data),
+            }
+        );
+
+        const playback = await this.enqueuePcm(loaded.pcm, {
+            ...metadata,
+            audio_url: normalizedUrl,
+        });
+
+        return {
+            ...playback,
+            bytesDownloaded: loaded.bytesDownloaded,
+            contentType: loaded.contentType,
+            cacheHit: false,
+        };
     }
 
     tick() {
@@ -311,6 +341,14 @@ class AudioOutput {
 
     hasPendingAudio() {
         return this.buffer.length > 0 || this.playbackJobs.length > 0;
+    }
+
+    bufferedMs() {
+        if (!this.buffer || !this.buffer.length || !this.frameBytes) {
+            return 0;
+        }
+
+        return Math.round((this.buffer.length / this.frameBytes) * this.frameMs);
     }
 
     padToFrameBoundary(pcmBuffer) {
@@ -435,8 +473,16 @@ function convertToPcm(filePath, options = {}) {
     });
 }
 
-async function downloadAudioToTemp(url) {
-    const response = await fetch(url);
+async function downloadAudioToTemp(url, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response;
+    try {
+        response = await fetch(url, { signal: controller.signal });
+    } finally {
+        clearTimeout(timeout);
+    }
 
     if (!response.ok) {
         throw new Error(`Could not download audio_url: HTTP ${response.status}`);
@@ -459,8 +505,140 @@ async function downloadAudioToTemp(url) {
     };
 }
 
+function getCachedAudioUrlPcm(cacheKey) {
+    const ttlMs = Number(env.audioUrlCacheTtlMs || 0);
+    if (ttlMs <= 0) {
+        return null;
+    }
+
+    const entry = audioUrlPcmCache.get(cacheKey);
+    if (!entry) {
+        return null;
+    }
+
+    if (Date.now() >= entry.expiresAt) {
+        audioUrlPcmCache.delete(cacheKey);
+        return null;
+    }
+
+    // Refresh LRU order
+    audioUrlPcmCache.delete(cacheKey);
+    audioUrlPcmCache.set(cacheKey, entry);
+
+    return entry;
+}
+
+function setCachedAudioUrlPcm(cacheKey, entry) {
+    const ttlMs = Number(env.audioUrlCacheTtlMs || 0);
+    const maxEntries = Math.max(1, Number(env.audioUrlCacheMaxEntries || 20));
+    if (ttlMs <= 0 || !entry || !entry.pcm || !entry.pcm.length) {
+        return;
+    }
+
+    // Cap single cached clip at 12 MB PCM (~2 minutes at 48kHz mono)
+    if (entry.pcm.length > 12 * 1024 * 1024) {
+        return;
+    }
+
+    audioUrlPcmCache.delete(cacheKey);
+    audioUrlPcmCache.set(cacheKey, {
+        ...entry,
+        expiresAt: Date.now() + ttlMs,
+    });
+
+    while (audioUrlPcmCache.size > maxEntries) {
+        const oldestKey = audioUrlPcmCache.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+        audioUrlPcmCache.delete(oldestKey);
+    }
+}
+
+async function loadAndConvertAudioUrlOnce(cacheKey, audioUrl, options) {
+    const existing = inFlightAudioUrlLoads.get(cacheKey);
+    if (existing) {
+        return existing;
+    }
+
+    const loader = (async () => {
+        const downloaded = await downloadAudioToTemp(audioUrl);
+
+        if (options.logger) {
+            options.logger("agent audio_url downloaded", {
+                audio_url: audioUrl,
+                bytes_downloaded: downloaded.bytes,
+                content_type: downloaded.contentType,
+                file_path: downloaded.filePath,
+                metadata: options.metadata,
+            });
+        }
+
+        try {
+            if (options.logger) {
+                options.logger("ffmpeg pcm conversion start", {
+                    file_path: downloaded.filePath,
+                    sample_rate: options.sampleRate,
+                    channel_count: options.channelCount,
+                    format: "s16le",
+                    metadata: {
+                        ...options.metadata,
+                        audio_url: audioUrl,
+                    },
+                });
+            }
+
+            const pcm = await convertToPcm(downloaded.filePath, {
+                sampleRate: options.sampleRate,
+                channelCount: options.channelCount,
+            });
+
+            if (options.logger) {
+                options.logger("ffmpeg pcm conversion ok", {
+                    file_path: downloaded.filePath,
+                    pcm_bytes: pcm.length,
+                    frames: Math.ceil(pcm.length / options.frameBytes),
+                    metadata: {
+                        ...options.metadata,
+                        audio_url: audioUrl,
+                    },
+                });
+            }
+
+            const result = {
+                pcm,
+                bytesDownloaded: downloaded.bytes,
+                contentType: downloaded.contentType,
+            };
+
+            setCachedAudioUrlPcm(cacheKey, result);
+
+            return result;
+        } finally {
+            await fsp.unlink(downloaded.filePath).catch(() => {});
+        }
+    })();
+
+    inFlightAudioUrlLoads.set(cacheKey, loader);
+
+    try {
+        return await loader;
+    } finally {
+        if (inFlightAudioUrlLoads.get(cacheKey) === loader) {
+            inFlightAudioUrlLoads.delete(cacheKey);
+        }
+    }
+}
+
+function clearAudioUrlPcmCache() {
+    audioUrlPcmCache.clear();
+    inFlightAudioUrlLoads.clear();
+}
+
 module.exports = {
     AudioOutput,
     convertToPcm,
     downloadAudioToTemp,
+    clearAudioUrlPcmCache,
+    _audioUrlPcmCache: audioUrlPcmCache,
 };
